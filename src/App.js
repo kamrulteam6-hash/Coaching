@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ─── SUPABASE REST CLIENT (no SDK — pure fetch) ───────────────
-const SUPABASE_URL = "https://qxnnovifctjpnbjnrrdz.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF4bm5vdmlmY3RqcG5iam5ycmR6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1NjE3MDYsImV4cCI6MjA4OTEzNzcwNn0.71SXK0LObW3P02g7I4dKmUue-GFDRyf0KCKH5Hu6yYI";
+const SUPABASE_URL = "https://mvyzzycjsxqwemdtioqu.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im12eXp6eWNqc3hxd2VtZHRpb3F1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ5NDk5NDcsImV4cCI6MjA5MDUyNTk0N30.360b6tAFmi8AmvQRo2xyuBZemtZVPzDEEiACh8quPQI";
 
 // Tiny Supabase REST wrapper — mirrors the SDK interface used throughout the app
 let _authToken = SUPABASE_ANON_KEY; // replaced with JWT after login
@@ -170,7 +170,7 @@ const supabase = {
 // ╔══════════════════════════════════════════════════════════╗
 // ║              CoachlyBD v16 - Production             ║
 // ║         Coaching Center Management Platform (BD)         ║
-// ║         Backend: Supabase (qxnnovifctjpnbjnrrdz)        ║
+// ║         Backend: Supabase (mvyzzycjsxqwemdtioqu)        ║
 // ║                                                          ║
 // ║  Update SUPPORT object below with your real numbers      ║
 // ╚══════════════════════════════════════════════════════════╝
@@ -719,9 +719,9 @@ function LoginScreen({ onLogin, staffAccounts = [], onStaffLogin }) {
 
 // ─── DASHBOARD ────────────────────────────────────────────────
 function Dashboard({ students, batches, teachers, payments, account, isPro, onUpgrade, setTab, staffMode }) {
-  const totalExpected = students.reduce((a, st) => a + getExpectedFee(st, monthKey, {}, batches), 0);
   const monthKey = `${MONTHS[CURRENT_MONTH]}-${CURRENT_YEAR}`;
   const prevMonthKey = `${MONTHS[CURRENT_MONTH - 1]}-${CURRENT_YEAR}`;
+  const totalExpected = students.reduce((a, st) => a + getExpectedFee(st, monthKey, {}, batches), 0);
   const collected = students.filter(s => payments[s.id]?.[monthKey]?.status === "paid").reduce((a, st) => a + getEffectiveFee(st, monthKey, {}), 0)
     + students.reduce((a, s) => { const ap = payments[s.id]?.["Admission-" + CURRENT_YEAR]; return a + (ap?.status === "paid" && ap?.amount ? ap.amount : 0); }, 0);
   const dueStudents = students.filter(s => payments[s.id]?.[monthKey]?.status === "unpaid");
