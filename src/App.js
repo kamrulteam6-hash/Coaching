@@ -211,7 +211,7 @@ const C_DARK = {
 // ─── LANGUAGE STRINGS ─────────────────────────────────────────
 const LANG = {
   en: {
-    dashboard: "Dashboard", students: "Students", batches: "Batches",
+    dashboard: "Dashboard", dueList: "Due List 🔴", students: "Students", batches: "Batches",
     teachers: "Teachers", fees: "Fees", exams: "Exams",
     messages: "Messages", settings: "Settings", help: "Help",
     addStudent: "Add Student", addBatch: "New Batch", addTeacher: "Add Teacher",
@@ -232,7 +232,7 @@ const LANG = {
     staffLogin: "Staff Sign In", ownerLogin: "Owner Login",
   },
   bn: {
-    dashboard: "ড্যাশবোর্ড", students: "শিক্ষার্থী", batches: "ব্যাচ",
+    dashboard: "ড্যাশবোর্ড", dueList: "বকেয়া তালিকা 🔴", students: "শিক্ষার্থী", batches: "ব্যাচ",
     teachers: "শিক্ষক", fees: "বেতন", exams: "পরীক্ষা",
     messages: "বার্তা", settings: "সেটিংস", help: "সাহায্য",
     addStudent: "শিক্ষার্থী যোগ করুন", addBatch: "নতুন ব্যাচ", addTeacher: "শিক্ষক যোগ করুন",
@@ -720,8 +720,8 @@ function LoginScreen({ onLogin, staffAccounts = [], onStaffLogin }) {
 // ─── DASHBOARD ────────────────────────────────────────────────
 function Dashboard({ students, batches, teachers, payments, account, isPro, onUpgrade, setTab, staffMode }) {
   const monthKey = `${MONTHS[CURRENT_MONTH]}-${CURRENT_YEAR}`;
-  const prevMonthKey = `${MONTHS[CURRENT_MONTH - 1]}-${CURRENT_YEAR}`;
   const totalExpected = students.reduce((a, st) => a + getExpectedFee(st, monthKey, {}, batches), 0);
+  const prevMonthKey = `${MONTHS[CURRENT_MONTH - 1]}-${CURRENT_YEAR}`;
   const collected = students.filter(s => payments[s.id]?.[monthKey]?.status === "paid").reduce((a, st) => a + getEffectiveFee(st, monthKey, {}), 0)
     + students.reduce((a, s) => { const ap = payments[s.id]?.["Admission-" + CURRENT_YEAR]; return a + (ap?.status === "paid" && ap?.amount ? ap.amount : 0); }, 0);
   const dueStudents = students.filter(s => payments[s.id]?.[monthKey]?.status === "unpaid");
@@ -3976,6 +3976,267 @@ function StaffManager({ staffAccounts, setStaffAccounts, toast, account }) {
 
 
 // ─── FEE DUE REMINDER SYSTEM ─────────────────────────────────
+// ══════════════════════════════════════════════════════
+// DUE LIST — Full dedicated page with filters + bulk WhatsApp
+// ══════════════════════════════════════════════════════
+function DueListPage({ students, payments, batches, feeOverrides, setPayments, account, toast, setTab }) {
+  const [filterBatch, setFilterBatch] = useState("all");
+  const [filterMonth, setFilterMonth] = useState(CURRENT_MONTH);
+  const [filterType, setFilterType] = useState("current"); // "current" | "overdue" | "all"
+  const [selected, setSelected] = useState({}); // { studentId: true }
+  const [dueSearch, setDueSearch] = useState("");
+  const [msgTemplate, setMsgTemplate] = useState("Dear {parent},\n\n{name}'s fee for {month} (৳{amount}) is still unpaid.\n\nPlease pay by the 10th.\n\nThank you.");
+  const [showBulkMsg, setShowBulkMsg] = useState(false);
+  const [showMsgEdit, setShowMsgEdit] = useState(false);
+
+  const monthKey = (mIdx) => `${MONTHS[mIdx]}-${CURRENT_YEAR}`;
+  const curKey = monthKey(CURRENT_MONTH);
+
+  // Build due list — all students with unpaid fees
+  const buildDueList = () => {
+    const q = dueSearch.trim().toLowerCase();
+    const list = [];
+    students.forEach(s => {
+      if (filterBatch !== "all" && s.batch !== filterBatch) return;
+      if (q && !s.name.toLowerCase().includes(q) && !(s.phone||"").includes(q) &&
+          !(s.fatherName||"").toLowerCase().includes(q) && !(s.motherName||"").toLowerCase().includes(q) &&
+          !(s.guardian||"").toLowerCase().includes(q)) return;
+      const unpaidMonths = [];
+      const checkMonths = filterType === "current"
+        ? [CURRENT_MONTH]
+        : filterType === "overdue"
+        ? Array.from({ length: CURRENT_MONTH }, (_, i) => i)
+        : Array.from({ length: CURRENT_MONTH + 1 }, (_, i) => i);
+
+      checkMonths.forEach(i => {
+        const mk = monthKey(i);
+        if (payments[s.id]?.[mk]?.status === "unpaid") {
+          unpaidMonths.push({ month: MONTHS[i], monthIdx: i, key: mk, amount: getEffectiveFee(s, mk, feeOverrides) });
+        }
+      });
+      if (unpaidMonths.length > 0) {
+        list.push({ ...s, unpaidMonths, totalDue: unpaidMonths.reduce((a, m) => a + m.amount, 0) });
+      }
+    });
+    return list.sort((a, b) => b.totalDue - a.totalDue);
+  };
+
+  const dueList = buildDueList();
+  const allSelected = dueList.length > 0 && dueList.every(s => selected[s.id]);
+  const selectedCount = Object.keys(selected).filter(id => selected[id]).length;
+  const totalDue = dueList.reduce((a, s) => a + s.totalDue, 0);
+  const selectedDue = dueList.filter(s => selected[s.id]).reduce((a, s) => a + s.totalDue, 0);
+
+  const toggleAll = () => {
+    if (allSelected) setSelected({});
+    else setSelected(Object.fromEntries(dueList.map(s => [s.id, true])));
+  };
+
+  const buildMsg = (s) => {
+    const parent = s.fatherName || s.motherName || s.guardian || "Guardian";
+    const monthsStr = s.unpaidMonths.map(m => m.month).join(", ");
+    return msgTemplate
+      .replace("{parent}", parent)
+      .replace("{name}", s.name)
+      .replace("{month}", monthsStr)
+      .replace("{amount}", s.totalDue.toLocaleString())
+      .replace("{batch}", s.batch);
+  };
+
+  const sendWhatsApp = (s) => {
+    const phone = (s.phone || "").replace(/[^0-9]/g, "");
+    const bd = phone.startsWith("0") ? "880" + phone.slice(1) : "880" + phone;
+    window.open("https://wa.me/" + bd + "?text=" + encodeURIComponent(buildMsg(s)), "_blank");
+  };
+
+  const sendBulk = () => {
+    const targets = dueList.filter(s => selected[s.id]);
+    if (targets.length === 0) { toast("⚠️ Select students first"); return; }
+    targets.forEach((s, i) => setTimeout(() => sendWhatsApp(s), i * 800));
+    setShowBulkMsg(false);
+    toast("📱 Opening WhatsApp for " + targets.length + " student(s)...");
+  };
+
+  const typeColors = { current: C.warning, overdue: C.danger, all: C.info };
+  const col = typeColors[filterType] || C.warning;
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ background: `linear-gradient(135deg, ${C.danger} 0%, #b91c1c 100%)`, borderRadius: 16, padding: "18px 20px", marginBottom: 18, color: "#fff" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 2 }}>Fee Collection — {MONTHS[CURRENT_MONTH]} {CURRENT_YEAR}</div>
+            <div style={{ fontSize: 22, fontWeight: 900, fontFamily: "Georgia, serif" }}>🔴 Due List</div>
+            <div style={{ fontSize: 13, opacity: 0.85, marginTop: 4 }}>{dueList.length} student(s) with unpaid fees · ৳{totalDue.toLocaleString()} pending</div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 28, fontWeight: 900, fontFamily: "Georgia, serif" }}>৳{totalDue.toLocaleString()}</div>
+            <div style={{ fontSize: 11, opacity: 0.75 }}>Total Pending</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{ background: C.card, borderRadius: 14, padding: 14, marginBottom: 14, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          {[["current", "This Month"], ["overdue", "Previous Months"], ["all", "All Unpaid"]].map(([v, l]) => (
+            <button key={v} onClick={() => { setFilterType(v); setSelected({}); }}
+              style={{ padding: "7px 14px", borderRadius: 20, border: "2px solid " + (filterType === v ? typeColors[v] : C.border), background: filterType === v ? typeColors[v] : C.bg, color: filterType === v ? "#fff" : C.muted, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 2 }}>
+          {[{ id: "all", name: "all", fullName: "All Batches" }, ...batches].map(b => {
+            const bDue = b.name === "all"
+              ? dueList.length
+              : dueList.filter(s => s.batch === b.name).length;
+            const isActive = filterBatch === b.name;
+            return (
+              <button key={b.id || "all"} onClick={() => { setFilterBatch(b.name); setSelected({}); }}
+                style={{ padding: "7px 14px", borderRadius: 20, border: "2px solid " + (isActive ? C.primary : C.border), background: isActive ? C.primary : C.bg, color: isActive ? "#fff" : C.text, fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                {b.fullName || b.name}
+                {bDue > 0 && <span style={{ background: isActive ? "rgba(255,255,255,0.25)" : C.danger, color: "#fff", borderRadius: 10, padding: "0px 6px", fontSize: 10, fontWeight: 800 }}>{bDue}</span>}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Batch breakdown summary */}
+      {batches.length > 1 && filterBatch === "all" && dueList.length > 0 && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+          {batches.map(b => {
+            const bList = dueList.filter(s => s.batch === b.name);
+            if (bList.length === 0) return null;
+            const bTotal = bList.reduce((a, s) => a + s.totalDue, 0);
+            return (
+              <div key={b.id} onClick={() => { setFilterBatch(b.name); setSelected({}); }}
+                style={{ background: C.card, borderRadius: 10, padding: "8px 12px", border: "1.5px solid " + C.border, cursor: "pointer", flex: 1, minWidth: 120 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: C.muted }}>{b.fullName || b.name}</div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: C.danger }}>৳{bTotal.toLocaleString()}</div>
+                <div style={{ fontSize: 11, color: C.muted }}>{bList.length} student(s)</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Search bar */}
+      <div style={{ marginBottom: 10 }}>
+        <input value={dueSearch} onChange={e => setDueSearch(e.target.value)}
+          placeholder="🔍 Search by name, phone, or guardian..."
+          style={{ width: "100%", padding: "9px 14px", borderRadius: 10, border: "1.5px solid " + C.border, fontSize: 13, outline: "none", background: C.white, color: C.text, fontFamily: FONT, boxSizing: "border-box" }} />
+      </div>
+
+      {/* Bulk Actions Bar */}
+      {dueList.length > 0 && (
+        <div style={{ background: C.card, borderRadius: 12, padding: "10px 14px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", boxShadow: "0 2px 8px rgba(0,0,0,0.05)" }}>
+          <input type="checkbox" checked={allSelected} onChange={toggleAll}
+            style={{ width: 16, height: 16, cursor: "pointer", accentColor: C.primary }} />
+          <span style={{ fontSize: 13, color: C.muted, flex: 1 }}>
+            {selectedCount > 0 ? `${selectedCount} selected — ৳${selectedDue.toLocaleString()} due` : "Select all / individual to bulk send"}
+          </span>
+          {selectedCount > 0 && (
+            <>
+              <button onClick={() => setShowBulkMsg(true)}
+                style={{ background: "#25D366", border: "none", borderRadius: 8, padding: "7px 14px", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                📱 WhatsApp {selectedCount}
+              </button>
+              <button onClick={() => setSelected({})}
+                style={{ background: C.bg, border: "1px solid " + C.border, borderRadius: 8, padding: "7px 12px", color: C.muted, fontSize: 12, cursor: "pointer" }}>
+                Clear
+              </button>
+            </>
+          )}
+          <button onClick={() => setShowMsgEdit(true)}
+            style={{ background: C.bg, border: "1px solid " + C.border, borderRadius: 8, padding: "7px 12px", color: C.muted, fontSize: 12, cursor: "pointer" }}>
+            ✏️ Edit Template
+          </button>
+        </div>
+      )}
+
+      {/* Due List */}
+      {dueList.length === 0 ? (
+        <div style={{ background: C.successLight, borderRadius: 16, padding: "32px 20px", textAlign: "center", border: "1px solid " + C.success + "30" }}>
+          <div style={{ fontSize: 44, marginBottom: 10 }}>🎉</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: C.success }}>All fees paid!</div>
+          <div style={{ fontSize: 13, color: C.success, opacity: 0.8, marginTop: 4 }}>No pending payments for the selected filter</div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {dueList.map(s => (
+            <div key={s.id} style={{ background: C.card, borderRadius: 12, padding: "12px 14px", border: "1.5px solid " + (selected[s.id] ? C.primary : C.border), boxShadow: "0 1px 6px rgba(0,0,0,0.04)", display: "flex", alignItems: "center", gap: 12 }}>
+              <input type="checkbox" checked={!!selected[s.id]} onChange={() => setSelected(prev => ({ ...prev, [s.id]: !prev[s.id] }))}
+                style={{ width: 16, height: 16, cursor: "pointer", accentColor: C.primary, flexShrink: 0 }} />
+              <div style={{ width: 38, height: 38, borderRadius: 10, background: C.danger + "20", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: C.danger, flexShrink: 0 }}>
+                {s.avatar || initials(s.name)}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: C.text }}>{s.name}</span>
+                  <span style={{ fontSize: 11, background: C.borderLight, color: C.muted, padding: "1px 7px", borderRadius: 10, fontWeight: 600 }}>{s.batch}</span>
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                  {s.fatherName || s.motherName || s.guardian || ""} · {s.phone}
+                </div>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 4 }}>
+                  {s.unpaidMonths.map(m => (
+                    <span key={m.key} style={{ fontSize: 10, background: C.dangerLight, color: C.danger, padding: "2px 7px", borderRadius: 6, fontWeight: 700 }}>
+                      {m.month} ৳{m.amount.toLocaleString()}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div style={{ textAlign: "right", flexShrink: 0 }}>
+                <div style={{ fontSize: 16, fontWeight: 900, color: C.danger }}>৳{s.totalDue.toLocaleString()}</div>
+                <div style={{ fontSize: 10, color: C.muted, marginBottom: 6 }}>{s.unpaidMonths.length} month(s) due</div>
+                <button onClick={() => sendWhatsApp(s)}
+                  style={{ background: "#25D366", border: "none", borderRadius: 8, padding: "6px 12px", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
+                  📱 Remind
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Bulk WhatsApp Confirm Modal */}
+      {showBulkMsg && (
+        <Modal title={"📱 Send WhatsApp to " + selectedCount + " student(s)"} onClose={() => setShowBulkMsg(false)}>
+          <div style={{ background: C.bg, borderRadius: 10, padding: 12, marginBottom: 14, fontSize: 12, color: C.muted, lineHeight: 1.8 }}>
+            <div style={{ fontWeight: 700, color: C.text, marginBottom: 6 }}>Preview (first student):</div>
+            <div style={{ fontFamily: "monospace", whiteSpace: "pre-wrap", fontSize: 12 }}>
+              {dueList.find(s => selected[s.id]) ? buildMsg(dueList.find(s => selected[s.id])) : ""}
+            </div>
+          </div>
+          <div style={{ background: C.warningLight, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12, color: C.warning, fontWeight: 600 }}>
+            ⚠️ Will open WhatsApp {selectedCount} time(s) — one per student, 0.8s apart
+          </div>
+          <Btn full variant="primary" onClick={sendBulk} style={{ marginBottom: 8 }}>📱 Start Sending</Btn>
+          <Btn full variant="soft" onClick={() => setShowBulkMsg(false)}>Cancel</Btn>
+        </Modal>
+      )}
+
+      {/* Message Template Editor */}
+      {showMsgEdit && (
+        <Modal title="✏️ Edit Reminder Template" onClose={() => setShowMsgEdit(false)}>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, lineHeight: 1.7 }}>
+            <strong>Variables:</strong> {"{name}"} = student name, {"{parent}"} = parent name, {"{month}"} = month(s), {"{amount}"} = total due, {"{batch}"} = batch name
+          </div>
+          <textarea value={msgTemplate} onChange={e => setMsgTemplate(e.target.value)}
+            rows={7} style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1.5px solid " + C.border, fontSize: 13, fontFamily: "monospace", resize: "vertical", outline: "none", boxSizing: "border-box", color: C.text, background: C.white }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <Btn variant="soft" onClick={() => setMsgTemplate("Dear {parent},\n\n{name}'s fee for {month} (৳{amount}) is still unpaid.\n\nPlease pay by the 10th.\n\nThank you.")}>Reset</Btn>
+            <Btn variant="primary" full onClick={() => { setShowMsgEdit(false); toast("✅ Template saved!"); }}>Save Template</Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 function FeeDueReminders({ students, payments, batches, isPro, setTab }) {
   const monthKey = `${MONTHS[CURRENT_MONTH]}-${CURRENT_YEAR}`;
   const prevMonthKey = `${MONTHS[CURRENT_MONTH - 1]}-${CURRENT_YEAR}`;
@@ -4759,6 +5020,7 @@ function ExamResultsTab({ students, batches, examName, examDate, toast, openPrin
 
 const NAV_ITEMS = [
   { id: "Dashboard", icon: "d", labelKey: "dashboard" },
+  { id: "DueList",   icon: "!", labelKey: "dueList"   },
   { id: "Students",  icon: "s", labelKey: "students"  },
   { id: "Batches",   icon: "b", labelKey: "batches"   },
   { id: "Teachers",  icon: "t", labelKey: "teachers"  },
@@ -4907,7 +5169,7 @@ export default function CoachlyBD() {
   const currentNav = NAV_ITEMS.find(n => n.id === activeTab) || NAV_ITEMS[0];
 
   const NAV_ICONS = {
-    Dashboard: "📊", Students: "👥", Batches: "📚", Teachers: "👨‍🏫",
+    Dashboard: "📊", DueList: "🔴", Students: "👥", Batches: "📚", Teachers: "👨‍🏫",
     Fees: "💰", Exams: "📝", Messages: "💬", Settings: "⚙️", Help: "🆘"
   };
 
@@ -5059,6 +5321,7 @@ export default function CoachlyBD() {
 
         <div style={{ flex: 1, overflowY: "auto", padding: "24px 28px 48px", background: getC().bg }}>
           {activeTab === "Dashboard" && <Dashboard {...tabProps} onUpgrade={() => setShowPro(true)} setTab={setActiveTab} />}
+          {activeTab === "DueList"   && <DueListPage students={students} payments={payments} batches={batches} feeOverrides={feeOverrides} setPayments={setPayments} account={account} toast={showToast} setTab={setActiveTab} />}
           {activeTab === "Students"  && <Students  {...tabProps} feeOverrides={feeOverrides} />}
           {activeTab === "Batches"   && <Batches   {...tabProps} isPro={isPro} onUpgrade={() => setShowPro(true)} />}
           {activeTab === "Teachers"  && <Teachers  {...tabProps} />}
